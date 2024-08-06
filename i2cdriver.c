@@ -1,6 +1,8 @@
 #include "i2cdriver.h"
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
@@ -35,7 +37,7 @@ openSerialPort (const char *portname)
   return fd;
 }
 
-static int
+static size_t
 readFromSerialPort (int fd, uint8_t *b, size_t s)
 {
   ssize_t n;
@@ -121,35 +123,34 @@ crc_update (I2CDriver *sd, const uint8_t *data, size_t data_len)
 
 // ******************************  I2CDriver  *********************************
 
-void
+bool
 i2c_connect (I2CDriver *sd, const char *portname)
 {
-  int i;
-
   sd->connected = false;
   sd->port      = openSerialPort (portname);
   if (sd->port == -1)
     {
-      return;
+      return false;
     }
   writeToSerialPort (sd->port, (uint8_t *)"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@", 64);
 
   const uint8_t tests[] = "A\r\n\0xff";
-  for (i = 0; i < 4; i++)
+  for (int i = 0; i < 4; i++)
     {
       uint8_t tx[2] = { 'e', tests[i] };
       writeToSerialPort (sd->port, tx, 2);
       uint8_t rx[1];
-      int     n = readFromSerialPort (sd->port, rx, 1);
-      if ((n != 1) || (rx[0] != tests[i]))
+      readFromSerialPort (sd->port, rx, 1);
+      if (rx[0] != tests[i])
         {
-          return;
+          return false;
         }
     }
 
   sd->connected = true;
   i2c_getstatus (sd);
   sd->e_ccitt_crc = sd->ccitt_crc;
+  return true;
 }
 
 void
@@ -169,14 +170,12 @@ charCommand (I2CDriver *sd, char c)
   writeToSerialPort (sd->port, (uint8_t *)&c, 1);
 }
 
-static int
+static bool
 i2c_ack (I2CDriver *sd)
 {
   uint8_t a[1];
-  if (readFromSerialPort (sd->port, a, 1) != 1)
-    {
-      return 0;
-    }
+  readFromSerialPort (sd->port, a, 1);
+  // Bit 0 is set to 1 in case of success.
   return (a[0] & 1) != 0;
 }
 
@@ -230,22 +229,24 @@ i2c_stop (I2CDriver *sd)
   charCommand (sd, 'p');
 }
 
-int
+bool
 i2c_write (I2CDriver *sd, const uint8_t bytes[], size_t nn)
 {
-  size_t i;
-  int    ack = 1;
+  bool succesful_write = true;
 
-  for (i = 0; i < nn; i += 64)
+  for (size_t i = 0; i < nn; i += 64)
     {
       size_t  len     = ((nn - i) < 64) ? (nn - i) : 64;
       uint8_t cmd[65] = { (uint8_t)(0xc0 + len - 1) };
       memcpy (cmd + 1, bytes + i, len);
       writeToSerialPort (sd->port, cmd, 1 + len);
-      ack = i2c_ack (sd);
+      succesful_write &= i2c_ack (sd);
     }
-  crc_update (sd, bytes, nn);
-  return ack;
+  if (succesful_write)
+    {
+      crc_update (sd, bytes, nn);
+    }
+  return succesful_write;
 }
 
 void
