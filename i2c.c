@@ -16,8 +16,8 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
       switch (token[0])
         {
         case 'i':
-          i2c_getstatus (sd);
-          printf ("uptime %" SCNu64 "  %.3f V  %.0f mA  %.1f C SDA=%d SCL=%d speed=%d kHz\n", sd->uptime, sd->voltage_v,
+          i2c_update_status (sd);
+          printf ("uptime %lu %.3f V  %.0f mA  %.1f C SDA=%d SCL=%d speed=%dkHz\n", sd->uptime, sd->voltage_v,
                   sd->current_ma, sd->temp_celsius, sd->sda, sd->scl, sd->speed);
           break;
 
@@ -113,10 +113,10 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
           {
             char line[100];
 
-            i2c_monitor (sd, 1);
+            i2c_monitor (sd, true);
             printf ("[Hit return to exit monitor mode]\n");
             fgets (line, sizeof (line) - 1, stdin);
-            i2c_monitor (sd, 0);
+            i2c_monitor (sd, false);
           }
           break;
 
@@ -152,7 +152,7 @@ int
 main (int argc, char *argv[])
 {
   I2CDriver i2c;
-  if (argc < 2)
+  if (argc < 3)
     {
       printf ("Usage: i2ccl <PORTNAME> <commands>\n");
       exit (EXIT_FAILURE);

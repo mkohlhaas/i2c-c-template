@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
@@ -10,25 +11,24 @@
 // ****************************   Serial port  ********************************
 
 static int
-openSerialPort (const char *portname)
+openTerminalToFT230 (const char *portname)
 {
-  struct termios Settings;
-  int            fd;
 
-  fd = open (portname, O_RDWR | O_NOCTTY);
+  int fd = open (portname, O_RDWR | O_NOCTTY);
   if (fd == -1)
     {
       perror (portname);
       return -1;
     }
-  tcgetattr (fd, &Settings);
+  struct termios term_settings;
+  tcgetattr (fd, &term_settings);
 
-  cfsetispeed (&Settings, B1000000);
-  cfsetospeed (&Settings, B1000000);
+  cfsetispeed (&term_settings, B1000000);
+  cfsetospeed (&term_settings, B1000000);
 
-  cfmakeraw (&Settings);
-  Settings.c_cc[VMIN] = 1;
-  if (tcsetattr (fd, TCSANOW, &Settings) != 0)
+  cfmakeraw (&term_settings);
+  term_settings.c_cc[VMIN] = 1;
+  if (tcsetattr (fd, TCSANOW, &term_settings) != 0)
     {
       perror ("Serial settings");
       return -1;
@@ -38,7 +38,7 @@ openSerialPort (const char *portname)
 }
 
 static size_t
-readFromSerialPort (int fd, uint8_t *b, size_t s)
+readFromFT230 (int fd, uint8_t *b, size_t s)
 {
   ssize_t n;
   size_t  t = 0;
@@ -52,7 +52,7 @@ readFromSerialPort (int fd, uint8_t *b, size_t s)
     }
 
 #if VERBOSE
-  printf (" READ %d %d: ", (int)s, (int)n);
+  printf (" READ %zu %zd: ", s, n);
   for (size_t i = 0; i < s; i++)
     {
       printf ("%02x ", 0xff & b[i]);
@@ -64,11 +64,12 @@ readFromSerialPort (int fd, uint8_t *b, size_t s)
 }
 
 static void
-writeToSerialPort (int fd, const uint8_t *b, size_t s)
+writeToFT230 (int fd, const uint8_t *b, size_t s)
 {
   write (fd, b, s);
+
 #if VERBOSE
-  printf ("WRITE %u: ", (int)s);
+  printf ("WRITE %zu: ", s);
   for (size_t i = 0; i < s; i++)
     {
       printf ("%02x ", 0xff & b[i]);
@@ -123,32 +124,43 @@ crc_update (I2CDriver *sd, const uint8_t *data, size_t data_len)
 
 // ******************************  I2CDriver  *********************************
 
+// Connect to `FT230` chip via USB.
+// Returns `true` on successful connection.
 bool
 i2c_connect (I2CDriver *sd, const char *portname)
 {
-  sd->connected = false;
-  sd->port      = openSerialPort (portname);
+  *sd      = (I2CDriver){};
+  sd->port = openTerminalToFT230 (portname);
   if (sd->port == -1)
     {
       return false;
     }
-  writeToSerialPort (sd->port, (uint8_t *)"@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@", 64);
 
-  const uint8_t tests[] = "A\r\n\0xff";
-  for (int i = 0; i < 4; i++)
+  // Use echo command. Test all uint8_ts.
+  uint8_t const tests[] = {
+    'A',
+    '\r',
+    '\n',
+    0xff,
+  };
+
+  for (unsigned long i = 0; i < sizeof tests; i++)
     {
-      uint8_t tx[2] = { 'e', tests[i] };
-      writeToSerialPort (sd->port, tx, 2);
-      uint8_t rx[1];
-      readFromSerialPort (sd->port, rx, 1);
-      if (rx[0] != tests[i])
+      uint8_t tx[] = {
+        'e',
+        tests[i],
+      };
+      writeToFT230 (sd->port, tx, sizeof tx);
+      uint8_t rx;
+      readFromFT230 (sd->port, &rx, sizeof rx);
+      if (rx != tests[i])
         {
           return false;
         }
     }
 
-  sd->connected = true;
-  i2c_getstatus (sd);
+  i2c_update_status (sd);
+  sd->connected   = true;
   sd->e_ccitt_crc = sd->ccitt_crc;
   return true;
 }
@@ -159,48 +171,51 @@ i2c_disconnect (I2CDriver *sd)
   if (sd->connected)
     {
       closeSerialPort (sd->port);
-      sd->port      = -1;
-      sd->connected = false;
     }
+  *sd = (I2CDriver){};
 }
 
 static void
 charCommand (I2CDriver *sd, char c)
 {
-  writeToSerialPort (sd->port, (uint8_t *)&c, 1);
+  writeToFT230 (sd->port, (uint8_t *)&c, 1);
 }
 
 static bool
 i2c_ack (I2CDriver *sd)
 {
-  uint8_t a[1];
-  readFromSerialPort (sd->port, a, 1);
-  // Bit 0 is set to 1 in case of success.
-  return (a[0] & 1) != 0;
+  uint8_t a;
+  readFromFT230 (sd->port, &a, sizeof a);
+  return (a & 1) != 0;
 }
 
 void
-i2c_getstatus (I2CDriver *sd)
+i2c_update_status (I2CDriver *sd)
 {
-  uint8_t readbuffer[100];
+  uint8_t response_size = 80;
+  uint8_t readbuffer[response_size + 1];
   int     bytesRead;
-  uint8_t mode[80];
 
   charCommand (sd, '?');
-  bytesRead             = readFromSerialPort (sd->port, readbuffer, 80);
+  bytesRead = readFromFT230 (sd->port, readbuffer, response_size);
+
+#ifdef VERBOSE
+  // TODO: add log functions
+  // show bytes, readbuffer
+  // fprintf(stderr, "%d Bytes were read: %.*s\n", bytesRead, bytesRead, readbuffer);
+#endif
+
   readbuffer[bytesRead] = 0;
-  // printf("%d Bytes were read: %.*s\n", bytesRead, bytesRead, readbuffer);
-  sscanf ((char *)readbuffer, "[%15s %8s %" SCNu64 " %f %f %f %c %u %u %u %u %x ]", sd->model, sd->serial, &sd->uptime,
-          &sd->voltage_v, &sd->current_ma, &sd->temp_celsius, mode, &sd->sda, &sd->scl, &sd->speed, &sd->pullups,
-          &sd->ccitt_crc);
-  sd->mode = mode[0];
+  sscanf ((char *)readbuffer, "[%15s %8s %" SCNu64 "%f %f %f %c %" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNu8 "]",
+          sd->model, sd->serial, &sd->uptime, &sd->voltage_v, &sd->current_ma, &sd->temp_celsius, &sd->mode, &sd->sda,
+          &sd->scl, &sd->speed, &sd->pullups, &sd->ccitt_crc);
 }
 
 void
 i2c_scan (I2CDriver *sd, uint8_t devices[128])
 {
   charCommand (sd, 'd');
-  readFromSerialPort (sd->port, devices + 8, 112);
+  readFromFT230 (sd->port, devices + 8, 112);
 }
 
 uint8_t
@@ -208,7 +223,7 @@ i2c_reset (I2CDriver *sd)
 {
   charCommand (sd, 'x');
   uint8_t a[1];
-  if (readFromSerialPort (sd->port, a, 1) != 1)
+  if (readFromFT230 (sd->port, a, 1) != 1)
     {
       return 0;
     }
@@ -216,10 +231,13 @@ i2c_reset (I2CDriver *sd)
 }
 
 int
-i2c_start (I2CDriver *sd, uint8_t dev, uint8_t op)
+i2c_start (I2CDriver *sd, uint8_t dev, uint8_t rw)
 {
-  uint8_t start[2] = { 's', (uint8_t)((dev << 1) | op) };
-  writeToSerialPort (sd->port, start, sizeof (start));
+  uint8_t start[2] = {
+    's',
+    (dev << 1) | rw,
+  };
+  writeToFT230 (sd->port, start, sizeof start);
   return i2c_ack (sd);
 }
 
@@ -239,7 +257,7 @@ i2c_write (I2CDriver *sd, const uint8_t bytes[], size_t nn)
       size_t  len     = ((nn - i) < 64) ? (nn - i) : 64;
       uint8_t cmd[65] = { (uint8_t)(0xc0 + len - 1) };
       memcpy (cmd + 1, bytes + i, len);
-      writeToSerialPort (sd->port, cmd, 1 + len);
+      writeToFT230 (sd->port, cmd, 1 + len);
       succesful_write &= i2c_ack (sd);
     }
   if (succesful_write)
@@ -256,18 +274,21 @@ i2c_read (I2CDriver *sd, uint8_t bytes[], size_t nn)
 
   for (i = 0; i < nn; i += 64)
     {
-      size_t  len    = ((nn - i) < 64) ? (nn - i) : 64;
-      uint8_t cmd[1] = { (uint8_t)(0x80 + len - 1) };
-      writeToSerialPort (sd->port, cmd, 1);
-      readFromSerialPort (sd->port, bytes + i, len);
+      size_t  rest   = nn - 1;
+      size_t  len    = rest < 64 ? rest : 64;
+      uint8_t cmd[1] = {
+        0x80 + len - 1,
+      };
+      writeToFT230 (sd->port, cmd, 1);
+      readFromFT230 (sd->port, bytes + i, len);
       crc_update (sd, bytes + i, len);
     }
 }
 
 void
-i2c_monitor (I2CDriver *sd, int enable)
+i2c_monitor (I2CDriver *sd, bool enable)
 {
-  charCommand (sd, enable ? 'm' : '@');
+  charCommand (sd, enable ? 'm' : ' ');
 }
 
 void
@@ -275,17 +296,17 @@ i2c_capture (I2CDriver *sd)
 {
   printf ("Capture started\n");
   charCommand (sd, 'c');
-  uint8_t bytes[1];
+  uint8_t byte;
+  int     starting = 0;
+  int     nbits    = 0;
+  int     bits     = 0;
 
-  int starting = 0;
-  int nbits = 0, bits = 0;
   while (true)
     {
-      int i;
-      readFromSerialPort (sd->port, bytes, 1);
-      for (i = 0; i < 2; i++)
+      readFromFT230 (sd->port, &byte, 1);
+      for (int i = 0; i < 2; i++)
         {
-          int symbol = (i == 0) ? (bytes[0] >> 4) : (bytes[0] & 0xf);
+          int symbol = (i == 0) ? (byte >> 4) : (byte & 0xf);
           switch (symbol)
             {
             case 0:
