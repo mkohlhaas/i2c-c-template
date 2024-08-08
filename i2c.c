@@ -1,10 +1,26 @@
 #include "i2cdriver.h"
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-int
-i2c_commands (I2CDriver *sd, int argc, char *argv[])
+static void
+print_usage ()
+{
+  printf ("Commands are:");
+  printf ("\n");
+  printf ("  i              display status information (uptime, voltage, current, temperature)\n");
+  printf ("  x              I2C bus reset\n");
+  printf ("  d              device scan\n");
+  printf ("  w dev <bytes>  write bytes to I2C device dev\n");
+  printf ("  p              send a STOP\n");
+  printf ("  r dev N        read N bytes from I2C device dev, then STOP\n");
+  printf ("  m              enter I2C bus monitor mode\n");
+  printf ("  c              enter I2C bus capture mode\n");
+}
+
+static int
+i2c_commands (i2c_handle sd, int argc, char *argv[])
 {
   for (int i = 0; i < argc; i++)
     {
@@ -13,29 +29,26 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
         {
           goto badcommand;
         }
+
       switch (token[0])
         {
         case 'i':
-          i2c_update_status (sd);
-          printf ("uptime %lu %.3f V  %.0f mA  %.1f C SDA=%d SCL=%d speed=%dkHz\n", sd->uptime, sd->voltage_v,
-                  sd->current_ma, sd->temp_celsius, sd->sda, sd->scl, sd->speed);
+          i2c_status_t status;
+          i2c_get_status (sd, &status);
+          i2c_print_info (sd, &status);
           break;
 
         case 'x':
           {
-            uint8_t sda_scl = i2c_reset (sd);
-            printf ("Bus reset. SDA = %d, SCL = %d\n", 1 & (sda_scl >> 1), 1 & sda_scl);
+            printf ("I2C bus is free: %s\n", i2c_reset (sd) ? "true" : "false");
           }
           break;
 
         case 'd':
           {
-            uint8_t devices[128];
-            int     i;
-
+            uint8_t devices[MAX_I2C_ADDRESSES];
             i2c_scan (sd, devices);
-            printf ("\n");
-            for (i = 8; i < 0x78; i++)
+            for (int i = 0; i < MAX_I2C_ADDRESSES; i++)
               {
                 if (devices[i] == '1')
                   {
@@ -50,7 +63,6 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
                     printf ("\n");
                   }
               }
-            printf ("\n");
           }
           break;
 
@@ -62,10 +74,10 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
             token = argv[++i];
             uint8_t bytes[8192];
             char   *endptr = token;
-            size_t  nn     = 0;
-            while (nn < sizeof (bytes))
+            size_t  count  = 0;
+            while (count < sizeof (bytes))
               {
-                bytes[nn++] = strtol (endptr, &endptr, 0);
+                bytes[count++] = strtol (endptr, &endptr, 0);
                 if (*endptr == '\0')
                   {
                     break;
@@ -78,8 +90,8 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
                 endptr++;
               }
 
-            i2c_start (sd, dev, 0);
-            i2c_write (sd, bytes, nn);
+            i2c_start (sd, dev, write_op);
+            i2c_write_buffer (sd, count, bytes);
           }
           break;
 
@@ -92,8 +104,8 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
             size_t  nn = strtol (token, NULL, 0);
             uint8_t bytes[8192];
 
-            i2c_start (sd, dev, 1);
-            i2c_read (sd, bytes, nn);
+            i2c_start (sd, dev, read_op);
+            i2c_read_buffer (sd, nn, bytes);
             i2c_stop (sd);
 
             size_t i;
@@ -128,42 +140,28 @@ i2c_commands (I2CDriver *sd, int argc, char *argv[])
 
         default:
         badcommand:
-          fprintf (stderr, "Bad command '%s'\n", token);
-          fprintf (stderr, "\n");
-          fprintf (stderr, "Commands are:");
-          fprintf (stderr, "\n");
-          fprintf (stderr, "  i              display status information (uptime, voltage, current, temperature)\n");
-          fprintf (stderr, "  x              I2C bus reset\n");
-          fprintf (stderr, "  d              device scan\n");
-          fprintf (stderr, "  w dev <bytes>  write bytes to I2C device dev\n");
-          fprintf (stderr, "  p              send a STOP\n");
-          fprintf (stderr, "  r dev N        read N bytes from I2C device dev, then STOP\n");
-          fprintf (stderr, "  m              enter I2C bus monitor mode\n");
-          fprintf (stderr, "  c              enter I2C bus capture mode\n");
-          fprintf (stderr, "\n");
-
+          print_usage ();
           return EXIT_FAILURE;
         }
     }
 
   return EXIT_SUCCESS;
 }
+
 int
 main (int argc, char *argv[])
 {
-  I2CDriver i2c;
   if (argc < 3)
     {
-      printf ("Usage: i2ccl <PORTNAME> <commands>\n");
+      print_usage ();
       exit (EXIT_FAILURE);
     }
-  else
+
+  i2c_handle i2c;
+  if (!i2c_connect (&i2c, argv[1]))
     {
-      i2c_connect (&i2c, argv[1]);
-      if (!i2c.connected)
-        {
-          exit (EXIT_FAILURE);
-        }
-      return i2c_commands (&i2c, argc - 2, argv + 2);
+      exit (EXIT_FAILURE);
     }
+
+  return i2c_commands (i2c, argc - 2, argv + 2);
 }

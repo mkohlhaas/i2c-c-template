@@ -1,2 +1,0 @@
-- log error functions
-- Wrapper functions around raw protocol

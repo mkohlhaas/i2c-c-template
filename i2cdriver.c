@@ -1,19 +1,37 @@
 #include "i2cdriver.h"
+#include "error.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
 
+struct i2c
+{
+  int      port;        // port
+  uint16_t e_ccitt_crc; // Host CCITT crc, should match hardware crc
+  int      dummy;
+};
+
+// Returns a random integer between `min` and `max`.
+static int
+random_int (int min, int max)
+{
+  auto rnd = rand () % (max - min + 1);
+  return min + rnd;
+}
+
 // ****************************   Serial port  ********************************
 
+// Opens a terminal connection to the FT230 chip.
+// Returns a file handle or `-1` if unsuccesful.
 static int
 openTerminalToFT230 (const char *portname)
 {
-
   int fd = open (portname, O_RDWR | O_NOCTTY);
   if (fd == -1)
     {
@@ -37,14 +55,16 @@ openTerminalToFT230 (const char *portname)
   return fd;
 }
 
+// Reads `bytes` from FT230 chip.
+// Returns number of bytes read.
 static size_t
-readFromFT230 (int fd, uint8_t *b, size_t s)
+readFromFT230 (int fd, uint8_t *bytes, size_t s)
 {
   ssize_t n;
   size_t  t = 0;
   while (t < s)
     {
-      n = read (fd, b + t, s);
+      n = read (fd, bytes + t, s);
       if (n > 0)
         {
           t += n;
@@ -52,10 +72,10 @@ readFromFT230 (int fd, uint8_t *b, size_t s)
     }
 
 #if VERBOSE
-  printf (" READ %zu %zd: ", s, n);
+  printf ("READ %zu %zd: ", s, n);
   for (size_t i = 0; i < s; i++)
     {
-      printf ("%02x ", 0xff & b[i]);
+      printf ("%02x ", 0xff & bytes[i]);
     }
   printf ("\n");
 #endif
@@ -63,21 +83,23 @@ readFromFT230 (int fd, uint8_t *b, size_t s)
   return s;
 }
 
+// Writes `bytes` to FT230 chip.
 static void
-writeToFT230 (int fd, const uint8_t *b, size_t s)
+writeToFT230 (int fd, const uint8_t *bytes, size_t s)
 {
-  write (fd, b, s);
+  write (fd, bytes, s);
 
 #if VERBOSE
   printf ("WRITE %zu: ", s);
   for (size_t i = 0; i < s; i++)
     {
-      printf ("%02x ", 0xff & b[i]);
+      printf ("%02x ", 0xff & bytes[i]);
     }
   printf ("\n");
 #endif
 }
 
+// Closes terminal connection to FT230 chip.
 static void
 closeSerialPort (int hSerial)
 {
@@ -86,6 +108,7 @@ closeSerialPort (int hSerial)
 
 // ******************************  CCITT CRC  *********************************
 
+// CRC checksum table.
 static const uint16_t crc_table[256]
     = { 0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7, 0x8108, 0x9129, 0xa14a, 0xb16b, 0xc18c, 0xd1ad,
         0xe1ce, 0xf1ef, 0x1231, 0x0210, 0x3273, 0x2252, 0x52b5, 0x4294, 0x72f7, 0x62d6, 0x9339, 0x8318, 0xb37b, 0xa35a,
@@ -107,8 +130,9 @@ static const uint16_t crc_table[256]
         0x1ce0, 0x0cc1, 0xef1f, 0xff3e, 0xcf5d, 0xdf7c, 0xaf9b, 0xbfba, 0x8fd9, 0x9ff8, 0x6e17, 0x7e36, 0x4e55, 0x5e74,
         0x2e93, 0x3eb2, 0x0ed1, 0x1ef0 };
 
+// Update CRC checksum.
 static void
-crc_update (I2CDriver *sd, const uint8_t *data, size_t data_len)
+crc_update (i2c_handle sd, const uint8_t *data, size_t data_len)
 {
   unsigned int tbl_idx;
   uint16_t     crc = sd->e_ccitt_crc;
@@ -124,178 +148,256 @@ crc_update (I2CDriver *sd, const uint8_t *data, size_t data_len)
 
 // ******************************  I2CDriver  *********************************
 
-// Connect to `FT230` chip via USB.
-// Returns `true` on successful connection.
-bool
-i2c_connect (I2CDriver *sd, const char *portname)
+void
+i2c_print_info (i2c_handle sd, i2c_status_t *status)
 {
-  *sd      = (I2CDriver){};
-  sd->port = openTerminalToFT230 (portname);
-  if (sd->port == -1)
+  fprintf (stdout, "connected:    %s\n", sd->port != -1 ? "true" : "false");
+  fprintf (stdout, "model:        %s\n", status->model);
+  fprintf (stdout, "serial:       %s\n", status->serial);
+  fprintf (stdout, "uptime:       %lu seconds\n", status->uptime);
+  fprintf (stdout, "voltage:      %.3fV\n", status->voltage_v);
+  fprintf (stdout, "current:      %.1fmA\n", status->current_ma);
+  fprintf (stdout, "temperature:  %.1f°C\n", status->temp_celsius);
+  fprintf (stdout, "mode:         %s\n", status->mode == 'I' ? "I2C" : "BitBang");
+  fprintf (stdout, "sda:          %hhu\n", status->sda);
+  fprintf (stdout, "sdl:          %hhu\n", status->scl);
+  fprintf (stdout, "i2c bus free: %s\n", status->sda && status->scl ? "true" : "false");
+  fprintf (stdout, "speed:        %hhukHz\n", status->speed);
+  fprintf (stdout, "pullups:      %hhu\n", status->pullups);
+  fprintf (stdout, "hardware crc: 0x%hx\n", status->ccitt_crc);
+  fprintf (stdout, "host crc:     0x%hx\n", sd->e_ccitt_crc);
+}
+
+// Echo tests connection to FT230.
+// Write `byte` to FT230 and immediately read from FT230.
+// Returns `true` if both values are the same, otherwise `false`.
+static bool
+echo_test (i2c_handle sd, uint8_t byte)
+{
+  // echo command
+  uint8_t tx[] = {
+    'e',
+    byte,
+  };
+
+  // write
+  writeToFT230 (sd->port, tx, sizeof tx);
+  // read
+  uint8_t rx;
+  readFromFT230 (sd->port, &rx, sizeof rx);
+  // compare
+  if (rx == byte)
+    {
+      return true;
+    }
+  else
+    {
+      return false;
+    }
+}
+
+// Connect to `FT230` chip via USB.
+// `portname` is the name of the USB port.
+// Returns `true` on successful connection, otherwise `false`.
+bool
+i2c_connect (i2c_handle *sd, char const *portname)
+{
+  *sd = malloc (sizeof (**sd));
+  if (!(*sd))
+    {
+      logExit ("out of memory");
+    }
+  // open terminal to FT230
+  (*sd)->port = openTerminalToFT230 (portname);
+  if ((*sd)->port == -1)
     {
       return false;
     }
 
-  // Use echo command. Test all uint8_ts.
-  uint8_t const tests[] = {
-    'A',
-    '\r',
-    '\n',
-    0xff,
-  };
-
-  for (unsigned long i = 0; i < sizeof tests; i++)
+  // randomly test terminal connection
+  if (!echo_test (*sd, random_int (0, 255)))
     {
-      uint8_t tx[] = {
-        'e',
-        tests[i],
-      };
-      writeToFT230 (sd->port, tx, sizeof tx);
-      uint8_t rx;
-      readFromFT230 (sd->port, &rx, sizeof rx);
-      if (rx != tests[i])
-        {
-          return false;
-        }
+      return false;
     }
 
-  i2c_update_status (sd);
-  sd->connected   = true;
-  sd->e_ccitt_crc = sd->ccitt_crc;
+  // update I2CDriver information if valid connection
+  i2c_status_t status;
+  i2c_get_status (*sd, &status);
+  (*sd)->e_ccitt_crc = status.ccitt_crc; // initialize host crc checksum
+
   return true;
 }
 
 void
-i2c_disconnect (I2CDriver *sd)
+i2c_disconnect (i2c_handle sd)
 {
-  if (sd->connected)
+  if (sd->port != -1)
     {
       closeSerialPort (sd->port);
     }
-  *sd = (I2CDriver){};
+  sd->port = -1;
 }
 
+// Send `byte` to FT230.
 static void
-charCommand (I2CDriver *sd, char c)
+byte_command (i2c_handle sd, uint8_t byte)
 {
-  writeToFT230 (sd->port, (uint8_t *)&c, 1);
+  writeToFT230 (sd->port, &byte, 1);
 }
 
+// Check acknowledge of last i2c operation.
+// Returns `true` if acknowleged, otherwise `false`.
 static bool
-i2c_ack (I2CDriver *sd)
+check_ack (i2c_handle sd)
 {
-  uint8_t a;
-  readFromFT230 (sd->port, &a, sizeof a);
-  return (a & 1) != 0;
+  uint8_t byte;
+  readFromFT230 (sd->port, &byte, sizeof byte);
+  return byte & 1;
 }
 
 void
-i2c_update_status (I2CDriver *sd)
+i2c_set_speed (i2c_handle sd, i2c_speed_t speed)
 {
-  uint8_t response_size = 80;
-  uint8_t readbuffer[response_size + 1];
-  int     bytesRead;
-
-  charCommand (sd, '?');
-  bytesRead = readFromFT230 (sd->port, readbuffer, response_size);
-
-#ifdef VERBOSE
-  // TODO: add log functions
-  // show bytes, readbuffer
-  // fprintf(stderr, "%d Bytes were read: %.*s\n", bytesRead, bytesRead, readbuffer);
-#endif
-
-  readbuffer[bytesRead] = 0;
-  sscanf ((char *)readbuffer, "[%15s %8s %" SCNu64 "%f %f %f %c %" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNu8 "]",
-          sd->model, sd->serial, &sd->uptime, &sd->voltage_v, &sd->current_ma, &sd->temp_celsius, &sd->mode, &sd->sda,
-          &sd->scl, &sd->speed, &sd->pullups, &sd->ccitt_crc);
+  byte_command (sd, speed);
 }
 
+// Update current status of `sd`.
 void
-i2c_scan (I2CDriver *sd, uint8_t devices[128])
+i2c_get_status (i2c_handle sd, i2c_status_t *status)
 {
-  charCommand (sd, 'd');
-  readFromFT230 (sd->port, devices + 8, 112);
+  uint8_t const response_size = 80;
+  uint8_t       readbuffer[response_size + 1];
+  readbuffer[response_size] = 0;
+
+  byte_command (sd, '?');
+  readFromFT230 (sd->port, readbuffer, response_size);
+
+  sscanf ((char *)readbuffer, "[%15s %8s %" SCNu64 "%f %f %f %c %" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNu8 "%" SCNx16 "]",
+          status->model, status->serial, &status->uptime, &status->voltage_v, &status->current_ma,
+          &status->temp_celsius, &status->mode, &status->sda, &status->scl, &status->speed, &status->pullups,
+          &status->ccitt_crc);
 }
 
-uint8_t
-i2c_reset (I2CDriver *sd)
+// Scan i2c bus for devices.
+void
+i2c_scan (i2c_handle sd, uint8_t devices[MAX_I2C_ADDRESSES])
 {
-  charCommand (sd, 'x');
-  uint8_t a[1];
-  if (readFromFT230 (sd->port, a, 1) != 1)
-    {
-      return 0;
-    }
-  return a[0];
+  byte_command (sd, 'd');
+  readFromFT230 (sd->port, devices + 8, MAX_I2C_ADDRESSES);
 }
 
-int
-i2c_start (I2CDriver *sd, uint8_t dev, uint8_t rw)
+// Resets I2C bus.
+// Returns `true` if bus is free, otherwise `false`.
+bool
+i2c_reset (i2c_handle sd)
+{
+  byte_command (sd, 'x');
+  uint8_t sda_scl;
+  readFromFT230 (sd->port, &sda_scl, 1);
+  return ((sda_scl >> 1) & 1) && (sda_scl & 1);
+}
+
+// Starts a read or write operation.
+// Returns `true` if operation has been acknowleged.
+bool
+i2c_start (i2c_handle sd, uint8_t dev, i2c_rw_t op)
 {
   uint8_t start[2] = {
     's',
-    (dev << 1) | rw,
+    (dev << 1) | op,
   };
   writeToFT230 (sd->port, start, sizeof start);
-  return i2c_ack (sd);
+  return check_ack (sd);
 }
 
+// Stop the current i2c operation.
 void
-i2c_stop (I2CDriver *sd)
+i2c_stop (i2c_handle sd)
 {
-  charCommand (sd, 'p');
+  byte_command (sd, 'p');
+}
+
+// Returns true if hardware and host crc are the same.
+bool
+i2c_check_crc (i2c_handle sd)
+{
+  i2c_status_t status;
+  i2c_get_status (sd, &status);
+  return sd->e_ccitt_crc == status.ccitt_crc;
+}
+
+#define MAX_RW_SIZE 64
+
+// Writes `buffer` to FT230.
+bool
+i2c_write_buffer (i2c_handle sd, size_t s, uint8_t const buffer[s])
+{
+  for (size_t i = 0; i < s; i += MAX_RW_SIZE)
+    {
+      size_t rest = s - i;
+      size_t len  = rest < MAX_RW_SIZE ? rest : MAX_RW_SIZE;
+
+      uint8_t cmd[MAX_RW_SIZE + 1] = {
+        0xc0 + len - 1,
+      };
+      memcpy (cmd + 1, buffer + i, len);
+      writeToFT230 (sd->port, cmd, len + 1);
+      if (!check_ack (sd))
+        {
+          return false;
+        }
+    }
+  crc_update (sd, buffer, s);
+  return true;
 }
 
 bool
-i2c_write (I2CDriver *sd, const uint8_t bytes[], size_t nn)
+i2c_read_buffer (i2c_handle sd, size_t s, uint8_t buffer[s])
 {
-  bool succesful_write = true;
+  for (size_t i = 0; i < s; i += MAX_RW_SIZE)
+    {
+      size_t  rest = s - i;
+      size_t  len  = rest < MAX_RW_SIZE ? rest : MAX_RW_SIZE;
+      uint8_t cmd  = 0x80 + len - 1;
+      writeToFT230 (sd->port, &cmd, 1);
+      size_t bytes_read = readFromFT230 (sd->port, buffer + i, len);
+      if (bytes_read != len)
+        {
+          return false;
+        }
+      crc_update (sd, buffer + i, len);
+    }
+  return true;
+}
 
-  for (size_t i = 0; i < nn; i += 64)
+// Reads from `device` at `address` `count` bytes into `buffer`.
+// Returns `true` if read was succesful.
+bool
+i2c_read_register (i2c_handle sd, uint8_t device, uint8_t address, size_t count, uint8_t buffer[count])
+{
+  byte_command (sd, 'r');
+  uint8_t cmd[] = { device, address, count };
+  writeToFT230 (sd->port, cmd, sizeof cmd);
+  size_t bytes_read = readFromFT230 (sd->port, buffer, count);
+  if (bytes_read != count)
     {
-      size_t  len     = ((nn - i) < 64) ? (nn - i) : 64;
-      uint8_t cmd[65] = { (uint8_t)(0xc0 + len - 1) };
-      memcpy (cmd + 1, bytes + i, len);
-      writeToFT230 (sd->port, cmd, 1 + len);
-      succesful_write &= i2c_ack (sd);
+      return false;
     }
-  if (succesful_write)
-    {
-      crc_update (sd, bytes, nn);
-    }
-  return succesful_write;
+  crc_update (sd, buffer, count);
+  return true;
 }
 
 void
-i2c_read (I2CDriver *sd, uint8_t bytes[], size_t nn)
+i2c_monitor (i2c_handle sd, bool enable)
 {
-  size_t i;
-
-  for (i = 0; i < nn; i += 64)
-    {
-      size_t  rest   = nn - 1;
-      size_t  len    = rest < 64 ? rest : 64;
-      uint8_t cmd[1] = {
-        0x80 + len - 1,
-      };
-      writeToFT230 (sd->port, cmd, 1);
-      readFromFT230 (sd->port, bytes + i, len);
-      crc_update (sd, bytes + i, len);
-    }
+  byte_command (sd, enable ? 'm' : ' ');
 }
 
 void
-i2c_monitor (I2CDriver *sd, bool enable)
-{
-  charCommand (sd, enable ? 'm' : ' ');
-}
-
-void
-i2c_capture (I2CDriver *sd)
+i2c_capture (i2c_handle sd)
 {
   printf ("Capture started\n");
-  charCommand (sd, 'c');
+  byte_command (sd, 'c');
   uint8_t byte;
   int     starting = 0;
   int     nbits    = 0;
