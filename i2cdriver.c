@@ -281,7 +281,7 @@ void
 i2c_scan (i2c_handle sd, uint8_t devices[MAX_I2C_ADDRESSES])
 {
   byte_command (sd, 'd');
-  readFromFT230 (sd->port, devices + 8, MAX_I2C_ADDRESSES);
+  readFromFT230 (sd->port, devices, MAX_I2C_ADDRESSES);
 }
 
 // Resets I2C bus.

@@ -52,7 +52,7 @@ i2c_commands (i2c_handle sd, int argc, char *argv[])
               {
                 if (devices[i] == '1')
                   {
-                    printf ("%02x  ", i);
+                    printf ("%02x  ", i + 8);
                   }
                 else
                   {
