@@ -151,17 +151,23 @@ i2c_commands (i2c_handle sd, int argc, char *argv[])
 int
 main (int argc, char *argv[])
 {
+  // check args
   if (argc < 3)
     {
       print_usage ();
       exit (EXIT_FAILURE);
     }
 
-  i2c_handle i2c;
-  if (!i2c_connect (&i2c, argv[1]))
+  // connect to FT230 board
+  i2c_handle sd;
+  if (!i2c_connect (&sd, argv[1]))
     {
       exit (EXIT_FAILURE);
     }
 
-  return i2c_commands (i2c, argc - 2, argv + 2);
+  // execute commands
+  i2c_commands (sd, argc - 2, argv + 2);
+
+  // disconnect from FT230 board
+  i2c_disconnect (sd);
 }
